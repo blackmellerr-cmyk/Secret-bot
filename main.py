@@ -327,9 +327,8 @@ async def process_photo_invalid(message: Message):
 async def process_link(message: Message, state: FSMContext):
     raw_text = message.text.strip()
     clean_text = re.sub(r'\s+', '', raw_text)
-    pattern = r'^https://www\.roblox\.com/share\?code=[a-fA-F0-9]+&type=Server$'
 
-    if not re.match(pattern, clean_text):
+    if not clean_text.startswith("https://www.roblox.com/share?code=") or not clean_text.endswith("type=Server"):
         await message.answer("Отправьте ссылку именно на вип сервер.")
         return
 
