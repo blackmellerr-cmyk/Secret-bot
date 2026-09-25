@@ -328,7 +328,8 @@ async def process_link(message: Message, state: FSMContext):
     raw_text = message.text.strip()
     clean_text = re.sub(r'\s+', '', raw_text)
 
-    if not clean_text.startswith("https://www.roblox.com/share?code=") or not clean_text.endswith("type=Server"):
+    # Гибкая проверка ссылки Roblox (без привязки к www и предпросмотру)
+    if "roblox.com/share?code=" not in clean_text or not clean_text.endswith("type=Server"):
         await message.answer("Отправьте ссылку именно на вип сервер.")
         return
 
