@@ -17,9 +17,10 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     Message,
 )
+from fastapi import FastAPI
+import uvicorn
 
-# 🔒 БОЛЬШЕ НИКАКИХ ТОКЕНОВ В КОДЕ!
-# Бот автоматически берет токен из переменных окружения (Environment) на Render
+# Токен из переменных окружения Render
 TOKEN = os.getenv("TOKEN")
 
 # Включаем логирование
@@ -66,7 +67,7 @@ SECRET_DECLINE = {
     "Тропы": "троп",
 }
 
-# Главная Reply-клавиатура (появляется ТОЛЬКО после привязки канала)
+# Главная Reply-клавиатура
 def get_main_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -137,7 +138,7 @@ async def timer_task(bot: Bot, channel_id: str, message_id: int, secret_type: st
     if row and row[0] == 0:
         await expire_post(bot, channel_id, message_id, secret_type, post_db_id)
 
-# Динамическая проверка прав пользователя и бота в привязанном канале
+# Динамическая проверка прав пользователя и бота
 async def check_user_and_bot_rights(bot: Bot, user_id: int) -> str | None:
     conn = sqlite3.connect("bot.db")
     cursor = conn.cursor()
@@ -221,11 +222,9 @@ async def cmd_add_channel(message: Message, bot: Bot):
         await message.answer(f"❌ Ошибка: {e}")
 
 
-# Обработка кнопки снизу: "📥 Отправить секретку"
 @router.message(F.text == "📥 Отправить секретку")
 async def btn_send_secret(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    
     channel_id = await check_user_and_bot_rights(bot, user_id)
 
     if not channel_id:
@@ -242,11 +241,9 @@ async def btn_send_secret(message: Message, state: FSMContext, bot: Bot):
     await state.set_state(SecretForm.waiting_for_type)
 
 
-# Обработка кнопки снизу: "📋 Мои посты"
 @router.message(F.text == "📋 Мои посты")
 async def btn_my_posts(message: Message, bot: Bot):
     user_id = message.from_user.id
-
     channel_id = await check_user_and_bot_rights(bot, user_id)
     if not channel_id:
         await message.answer(
@@ -275,7 +272,6 @@ async def btn_my_posts(message: Message, bot: Bot):
     await message.answer("📋 Твои активные посты:\nНажми на пост, чтобы досрочно завершить его (удалить ссылку):", reply_markup=keyboard)
 
 
-# Досрочное завершение поста по инлайн-кнопке
 @router.callback_query(F.data.startswith("expire_"))
 async def process_early_expire(callback: CallbackQuery, bot: Bot):
     post_db_id = int(callback.data.split("_")[1])
@@ -301,7 +297,6 @@ async def process_early_expire(callback: CallbackQuery, bot: Bot):
     await callback.answer()
 
 
-# 1. Выбор типа секретки
 @router.callback_query(SecretForm.waiting_for_type, F.data.startswith("type_"))
 async def process_type(callback: CallbackQuery, state: FSMContext):
     secret_type = callback.data.split("_")[1]
@@ -315,7 +310,6 @@ async def process_type(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# 2. Получение фото
 @router.message(SecretForm.waiting_for_photo, F.photo)
 async def process_photo(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
@@ -329,11 +323,9 @@ async def process_photo_invalid(message: Message):
     await message.answer("Пожалуйста, отправь именно **фотографию**.")
 
 
-# 3. Получение ссылки, очистка от мусора, проверка и предпросмотр
 @router.message(SecretForm.waiting_for_link, F.text)
 async def process_link(message: Message, state: FSMContext):
     raw_text = message.text.strip()
-
     clean_text = re.sub(r'\s+', '', raw_text)
     pattern = r'^https://www\.roblox\.com/share\?code=[a-fA-F0-9]+&type=Server$'
 
@@ -377,7 +369,6 @@ async def process_link_invalid(message: Message):
     await message.answer("Пожалуйста, отправь ссылку текстом.")
 
 
-# 4. Подтверждение и публикация
 @router.callback_query(SecretForm.waiting_for_confirm, F.data.startswith("confirm_"))
 async def process_confirmation(callback: CallbackQuery, state: FSMContext, bot: Bot):
     action = callback.data.split("_")[1]
@@ -449,7 +440,15 @@ async def process_confirmation(callback: CallbackQuery, state: FSMContext, bot: 
     await callback.answer()
 
 
-async def main():
+# ==================== НАСТРОЙКА FASTAPI И ЗАПУСК ====================
+
+app = FastAPI()
+
+@app.get("/")
+def index():
+    return {"status": "Bot is alive!"}
+
+async def start_telegram_bot():
     if not TOKEN:
         print("❌ ОШИБКА: Не задан токен бота! Укажи переменную окружения TOKEN.")
         return
@@ -458,8 +457,15 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    print("Бот запущен безопасно через переменную окружения...")
+    print("Бот запущен через polling в фоновом режиме...")
     await dp.start_polling(bot)
 
+@app.on_event("startup")
+async def on_startup():
+    # Запускаем бота асинхронно вместе с FastAPI
+    asyncio.create_task(start_telegram_bot())
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Render передает порт через системную переменную PORT, по умолчанию ставим 8080
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
