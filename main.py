@@ -527,11 +527,18 @@ async def process_choose_template(callback: CallbackQuery, state: FSMContext):
         title = "<b>Измененный шаблон (время вышло)</b>"
         hint = "Доступная переменная: <code>{secret_type}</code>"
 
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к выбору шаблонов", callback_data="adm_edit_templates")]
+        ]
+    )
+
     await callback.message.edit_text(
         f"📝 Редактирование: {title}\n\n"
         f"Отправьте новый текст шаблона. Поддерживается полноценный HTML, скрытые теги эмодзи и ссылки.\n\n"
         f"{hint}",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=keyboard
     )
     await state.set_state(AdminStates.waiting_for_template_text)
     await callback.answer()
