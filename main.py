@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -15,19 +15,21 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Message,
 )
 from fastapi import FastAPI
 import uvicorn
 
-# Токен и ID администратора из переменных окружения (скрыты от посторонних)
+# Токен и ID главного администратора из переменных окружения
 TOKEN = os.getenv("TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # Включаем логирование
 logging.basicConfig(level=logging.INFO)
 router = Router()
+
+# Часовой пояс МСК (UTC+3)
+MSK_TZ = timezone(timedelta(hours=3))
 
 # ==================== БАЗА ДАННЫХ (SQLite) ====================
 def init_db():
@@ -64,11 +66,19 @@ def init_db():
         )
     """)
     
-    # Таблица настроек
+    # Таблица настроек и шаблонов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+    
+    # Таблица дополнительных администраторов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT
         )
     """)
     
@@ -80,10 +90,47 @@ def init_db():
     cursor.executemany("INSERT OR IGNORE INTO secret_types (name, declined) VALUES (?, ?)", default_types)
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('timer_seconds', '510')")
     
+    # Дефолтный шаблон активного поста
+    default_active_template = (
+        "❕Секретка❕\n"
+        "Секретка: [Тип_Секретки]\n\n"
+        "Правила:\n"
+        "1. Не ускорять\n"
+        "2. Выйти с сервера после получения [Склоненный_Тип]\n"
+        "3. Не покупать негативные мутаторы\n"
+        "4. Не подниматься выше уровня над секреткой и не идти к воротам ускорения\n"
+        "При несоблюдении правил, вы получите бан.\n"
+        "Обжаловать бан можно в <a href='https://t.me/ToHSecrets_bot'>поддержке</a>!\n\n"
+        "Секретка: [Ссылка]\n\n"
+        "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+    )
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('template_active', ?)", (default_active_template,))
+
+    # Дефолтный шаблон истекшего поста
+    default_expired_template = (
+        "❕Секретка❕\n"
+        "Секретка: [Тип_Секретки]\n\n"
+        "Секретка: Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
+        "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | "
+        "Наш <a href='https://t.me/ToHSecretss'>канал</a> | "
+        "Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+    )
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('template_expired', ?)", (default_expired_template,))
+    
     conn.commit()
     conn.close()
 
 init_db()
+
+def is_admin(user_id: int) -> bool:
+    if user_id == SUPER_ADMIN_ID:
+        return True
+    conn = sqlite3.connect("bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
 
 def get_timer_duration() -> int:
     conn = sqlite3.connect("bot.db")
@@ -101,6 +148,14 @@ def get_secret_types_dict() -> dict:
     conn.close()
     return {row[0]: row[1] for row in rows}
 
+def get_template(key: str) -> str:
+    conn = sqlite3.connect("bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else ""
+
 # Состояния FSM
 class SecretForm(StatesGroup):
     waiting_for_type = State()
@@ -112,6 +167,9 @@ class AdminStates(StatesGroup):
     waiting_for_new_type_name = State()
     waiting_for_new_type_declined = State()
     waiting_for_new_timer = State()
+    waiting_for_admin_input = State()
+    waiting_for_template_active = State()
+    waiting_for_template_expired = State()
 
 # Клавиатуры
 def get_main_reply_keyboard(user_id: int):
@@ -119,7 +177,7 @@ def get_main_reply_keyboard(user_id: int):
         [KeyboardButton(text="📥 Отправить секретку")],
         [KeyboardButton(text="📋 Мои посты")]
     ]
-    if user_id == ADMIN_ID:
+    if is_admin(user_id):
         keyboard.append([KeyboardButton(text="⚙️ Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -127,10 +185,21 @@ def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика за день", callback_data="adm_stats")],
+            [InlineKeyboardButton(text="👥 Управление админами", callback_data="adm_manage_admins")],
+            [InlineKeyboardButton(text="📝 Редактировать шаблоны", callback_data="adm_edit_templates")],
             [InlineKeyboardButton(text="➕ Добавить тип секретки", callback_data="adm_add_type")],
             [InlineKeyboardButton(text="🗑 Удалить тип секретки", callback_data="adm_del_type")],
             [InlineKeyboardButton(text="⏱ Изменить время таймера", callback_data="adm_set_timer")],
             [InlineKeyboardButton(text="🔙 Выход", callback_data="adm_exit")],
+        ]
+    )
+
+def get_templates_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Шаблон активного поста", callback_data="tmpl_active")],
+            [InlineKeyboardButton(text="✏️ Шаблон истекшего поста", callback_data="tmpl_expired")],
+            [InlineKeyboardButton(text="🔙 Назад в админ-панель", callback_data="adm_back")],
         ]
     )
 
@@ -158,14 +227,8 @@ async def expire_post(bot: Bot, channel_id: str, message_id: int, secret_type: s
     conn.commit()
     conn.close()
 
-    expired_text = (
-        f"❕Секретка❕\n"
-        f"Секретка: {secret_type}\n\n"
-        f"Секретка: Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
-        f"🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | "
-        f"Наш <a href='https://t.me/ToHSecretss'>канал</a> | "
-        f"Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
-    )
+    template = get_template("template_expired")
+    expired_text = template.replace("[Тип_Секретки]", secret_type)
 
     try:
         await bot.edit_message_caption(
@@ -277,7 +340,7 @@ async def cmd_add_channel(message: Message, bot: Bot):
 
 @router.message(F.text == "⚙️ Админ-панель")
 async def admin_panel(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     await state.clear()
     current_timer = get_timer_duration()
@@ -293,11 +356,15 @@ async def admin_panel(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "adm_stats")
-async def adm_stats(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+async def adm_stats(callback: CallbackQuery, bot: Bot):
+    if not is_admin(callback.from_user.id):
         return
 
-    yesterday = datetime.now() - timedelta(days=1)
+    # Считаем время по МСК
+    now_msk = datetime.now(MSK_TZ)
+    yesterday_msk = now_msk - timedelta(days=1)
+    # Переводим в строку для сравнения с БД (в БД SQLite сохраняет datetime в UTC или локальном, сравниваем по строкам дат)
+    since_str = yesterday_msk.strftime('%Y-%m-%d %H:%M:%S')
     
     conn = sqlite3.connect("bot.db")
     cursor = conn.cursor()
@@ -306,7 +373,7 @@ async def adm_stats(callback: CallbackQuery):
         FROM posts 
         WHERE created_at >= ? 
         GROUP BY user_id
-    """, (yesterday.strftime('%Y-%m-%d %H:%M:%S'),))
+    """, (since_str,))
     user_stats = cursor.fetchall()
 
     cursor.execute("""
@@ -314,24 +381,33 @@ async def adm_stats(callback: CallbackQuery):
         FROM posts 
         WHERE created_at >= ? 
         ORDER BY created_at DESC
-    """, (yesterday.strftime('%Y-%m-%d %H:%M:%S'),))
+    """, (since_str,))
     all_posts = cursor.fetchall()
     conn.close()
 
     if not user_stats:
         await callback.message.edit_text(
-            "📊 <b>Статистика за последние 24 часа:</b>\n\n📭 За это время не было опубликовано ни одной секретки.",
+            "📊 <b>Статистика за последние 24 часа (МСК):</b>\n\n📭 За это время не было опубликовано ни одной секретки.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")]])
         )
         await callback.answer()
         return
 
-    stats_text = "📊 <b>Статистика постов за последние 24 часа:</b>\n\n"
+    stats_text = "📊 <b>Статистика постов за последние 24 часа (МСК):</b>\n\n"
     
     stats_text += "<b>👤 По количеству от администраторов:</b>\n"
     for u_id, count in user_stats:
-        stats_text += f"• ID <code>{u_id}</code>: <b>{count}</b> пост(ов)\n"
+        admin_name = f"ID {u_id}"
+        try:
+            chat_info = await bot.get_chat(u_id)
+            if chat_info.username:
+                admin_name = f"@{chat_info.username}"
+            elif chat_info.first_name:
+                admin_name = chat_info.first_name
+        except Exception:
+            pass
+        stats_text += f"• {admin_name} (<code>{u_id}</code>): <b>{count}</b> пост(ов)\n"
     
     stats_text += "\n<b>📋 Список всех постов:</b>\n"
     for u_id, ch_id, msg_id, s_type, dt in all_posts:
@@ -341,7 +417,15 @@ async def adm_stats(callback: CallbackQuery):
         else:
             post_link = f"https://t.me/{clean_ch}/{msg_id}"
             
-        stats_text += f"• [{s_type}] Администратор <code>{u_id}</code> — <a href='{post_link}'>Открыть пост</a> ({dt})\n"
+        admin_name = f"ID {u_id}"
+        try:
+            chat_info = await bot.get_chat(u_id)
+            if chat_info.username:
+                admin_name = f"@{chat_info.username}"
+        except Exception:
+            pass
+            
+        stats_text += f"• [{s_type}] {admin_name} (<code>{u_id}</code>) — <a href='{post_link}'>Открыть пост</a> ({dt})\n"
 
     if len(stats_text) > 4000:
         stats_text = stats_text[:3950] + "\n\n... (список сокращен из-за лимита длины)"
@@ -355,6 +439,182 @@ async def adm_stats(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "adm_manage_admins")
+async def adm_manage_admins(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        await callback.answer("❌ Только главный админ может управлять списком администраторов.", show_alert=True)
+        return
+
+    conn = sqlite3.connect("bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username FROM admins")
+    admins = cursor.fetchall()
+    conn.close()
+
+    text = "👥 <b>Управление администраторами</b>\n\nТекущие доп. админы:\n"
+    buttons = []
+    if admins:
+        for a_id, a_username in admins:
+            name_display = f"@{a_username}" if a_username else f"ID {a_id}"
+            text += f"• {name_display} (<code>{a_id}</code>)\n"
+            buttons.append([InlineKeyboardButton(text=f"🗑 Удалить админа: {name_display}", callback_data=f"deladmin_{a_id}")])
+    else:
+        text += "<i>Список пуст.</i>\n"
+
+    text += "\nНажми кнопку ниже, чтобы добавить нового администратора."
+    buttons.append([InlineKeyboardButton(text="➕ Добавить администратора", callback_data="add_admin_prompt")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")])
+
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "add_admin_prompt")
+async def add_admin_prompt(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        return
+    await callback.message.edit_text(
+        "➕ Введите <b>Telegram ID</b> или <b>юзернейм (@username)</b> нового администратора:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.waiting_for_admin_input)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_admin_input, F.text)
+async def process_new_admin(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    raw_input = message.text.strip()
+    target_id = None
+    target_username = None
+
+    if raw_input.isdigit():
+        target_id = int(raw_input)
+        try:
+            chat_info = await bot.get_chat(target_id)
+            target_username = chat_info.username
+        except Exception:
+            pass
+    elif raw_input.startswith("@"):
+        username_clean = raw_input[1:]
+        try:
+            chat_info = await bot.get_chat(raw_input)
+            target_id = chat_info.id
+            target_username = username_clean
+        except Exception:
+            await message.answer("❌ Не удалось найти пользователя по такому юзернейму. Убедитесь, что он хоть раз запускал бота.")
+            return
+    else:
+        await message.answer("❌ Неверный формат. Введите ID (цифры) или юзернейм (начинающийся с @). Попробуйте снова:")
+        return
+
+    conn = sqlite3.connect("bot.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO admins (user_id, username) VALUES (?, ?)", (target_id, target_username))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer(f"✅ Пользователь с ID <code>{target_id}</code> успешно добавлен в список администраторов!", parse_mode="HTML", reply_markup=get_main_reply_keyboard(message.from_user.id))
+
+
+@router.callback_query(F.data.startswith("deladmin_"))
+async def process_delete_admin(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        return
+    admin_to_del = int(callback.data.split("_")[1])
+
+    conn = sqlite3.connect("bot.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM admins WHERE user_id = ?", (admin_to_del,))
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text(f"✅ Администратор с ID <code>{admin_to_del}</code> удален.", parse_mode="HTML")
+    await callback.answer()
+
+
+# Редактирование шаблонов
+@router.callback_query(F.data == "adm_edit_templates")
+async def adm_edit_templates(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(
+        "📝 <b>Редактирование шаблонов сообщений</b>\n\n"
+        "Вы можете настроить текст для активного поста и для поста после истечения времени таймера.\n\n"
+        "💡 <b>Доступные теги для подстановки:</b>\n"
+        "• <code>[Тип_Секретки]</code> — подставит название (например, <i>Лапка</i>)\n"
+        "• <code>[Склоненный_Тип]</code> — подставит форму склонения (например, <i>лапки</i>)\n"
+        "• <code>[Ссылка]</code> — подставит ссылку на вип-сервер (только для активного поста)\n\n"
+        "Выберите шаблон для изменения:",
+        parse_mode="HTML",
+        reply_markup=get_templates_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "tmpl_active")
+async def tmpl_active_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    current_tmpl = get_template("template_active")
+    await callback.message.edit_text(
+        f"📝 <b>Текущий шаблон активного поста:</b>\n\n<pre>{current_tmpl}</pre>\n\n"
+        f"Отправьте новый текст шаблона с учетом тегов <code>[Тип_Секретки]</code>, <code>[Склоненный_Тип]</code> и <code>[Ссылка]</code>:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.waiting_for_template_active)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_template_active, F.text)
+async def process_template_active(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    new_tmpl = message.text
+
+    conn = sqlite3.connect("bot.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET value = ? WHERE key = 'template_active'", (new_tmpl,))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer("✅ Шаблон активного поста успешно обновлен!", reply_markup=get_main_reply_keyboard(message.from_user.id))
+
+
+@router.callback_query(F.data == "tmpl_expired")
+async def tmpl_expired_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    current_tmpl = get_template("template_expired")
+    await callback.message.edit_text(
+        f"📝 <b>Текущий шаблон истекшего поста:</b>\n\n<pre>{current_tmpl}</pre>\n\n"
+        f"Отправьте новый текст шаблона с учетом тега <code>[Тип_Секретки]</code>:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.waiting_for_template_expired)
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_template_expired, F.text)
+async def process_template_expired(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    new_tmpl = message.text
+
+    conn = sqlite3.connect("bot.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET value = ? WHERE key = 'template_expired'", (new_tmpl,))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer("✅ Шаблон истекшего поста успешно обновлен!", reply_markup=get_main_reply_keyboard(message.from_user.id))
+
+
 @router.callback_query(F.data == "adm_exit")
 async def adm_exit(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -364,7 +624,7 @@ async def adm_exit(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "adm_set_timer")
 async def adm_set_timer(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text(
         "⏱ Введите новое время таймера **в секундах** (например, `510` для 8.5 минут):",
@@ -376,7 +636,7 @@ async def adm_set_timer(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_for_new_timer, F.text)
 async def process_new_timer(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     
     if not message.text.isdigit():
@@ -396,7 +656,7 @@ async def process_new_timer(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "adm_add_type")
 async def adm_add_type(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     await callback.message.edit_text("➕ Введите название нового типа секретки (например, <code>Звезда</code>):", parse_mode="HTML")
     await state.set_state(AdminStates.waiting_for_new_type_name)
@@ -405,7 +665,7 @@ async def adm_add_type(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_for_new_type_name, F.text)
 async def process_new_type_name(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     type_name = message.text.strip()
     await state.update_data(new_type_name=type_name)
@@ -419,7 +679,7 @@ async def process_new_type_name(message: Message, state: FSMContext):
 
 @router.message(AdminStates.waiting_for_new_type_declined, F.text)
 async def process_new_type_declined(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     declined_form = message.text.strip()
     data = await state.get_data()
@@ -437,7 +697,7 @@ async def process_new_type_declined(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "adm_del_type")
 async def adm_del_type(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     types_dict = get_secret_types_dict()
     if not types_dict:
@@ -456,7 +716,7 @@ async def adm_del_type(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("deltype_"))
 async def process_delete_type(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     type_to_del = callback.data.split("_", 1)[1]
 
@@ -472,7 +732,7 @@ async def process_delete_type(callback: CallbackQuery):
 
 @router.callback_query(F.data == "adm_back")
 async def adm_back(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if not is_admin(callback.from_user.id):
         return
     current_timer = get_timer_duration()
     minutes = current_timer // 60
@@ -613,18 +873,12 @@ async def process_link(message: Message, state: FSMContext):
     types_dict = get_secret_types_dict()
     declined_type = types_dict.get(secret_type, secret_type)
 
+    template = get_template("template_active")
     preview_text = (
-        f"❕Секретка❕\n"
-        f"Секретка: {secret_type}\n\n"
-        f"Правила:\n"
-        f"1. Не ускорять\n"
-        f"2. Выйти с сервера после получения {declined_type}\n"
-        f"3. Не покупать негативные мутаторы\n"
-        f"4. Не подниматься выше уровня над секреткой и не идти к воротам ускорения\n"
-        f"При несоблюдении правил, вы получите бан.\n"
-        f"Обжаловать бан можно в <a href='https://t.me/ToHSecrets_bot'>поддержке</a>!\n\n"
-        f"Секретка: {link}\n\n"
-        f"🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+        template
+        .replace("[Тип_Секретки]", secret_type)
+        .replace("[Склоненный_Тип]", declined_type)
+        .replace("[Ссылка]", link)
     )
 
     await message.answer("Вот как будет выглядеть твой пост:")
@@ -664,18 +918,12 @@ async def process_confirmation(callback: CallbackQuery, state: FSMContext, bot: 
         types_dict = get_secret_types_dict()
         declined_type = types_dict.get(secret_type, secret_type)
 
+        template = get_template("template_active")
         final_text = (
-            f"❕Секретка❕\n"
-            f"Секретка: {secret_type}\n\n"
-            f"Правила:\n"
-            f"1. Не ускорять\n"
-            f"2. Выйти с сервера после получения {declined_type}\n"
-            f"3. Не покупать негативные мутаторы\n"
-            f"4. Не подниматься выше уровня над секреткой и не идти к воротам ускорения\n"
-            f"При несоблюдении правил, вы получите бан.\n"
-            f"Обжаловать бан можно в <a href='https://t.me/ToHSecrets_bot'>поддержке</a>!\n\n"
-            f"Секретка: {link}\n\n"
-            f"🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+            template
+            .replace("[Тип_Секретки]", secret_type)
+            .replace("[Склоненный_Тип]", declined_type)
+            .replace("[Ссылка]", link)
         )
 
         try:
