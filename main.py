@@ -360,10 +360,8 @@ async def adm_stats(callback: CallbackQuery, bot: Bot):
     if not is_admin(callback.from_user.id):
         return
 
-    # Считаем время по МСК
     now_msk = datetime.now(MSK_TZ)
     yesterday_msk = now_msk - timedelta(days=1)
-    # Переводим в строку для сравнения с БД (в БД SQLite сохраняет datetime в UTC или локальном, сравниваем по строкам дат)
     since_str = yesterday_msk.strftime('%Y-%m-%d %H:%M:%S')
     
     conn = sqlite3.connect("bot.db")
@@ -536,7 +534,6 @@ async def process_delete_admin(callback: CallbackQuery):
     await callback.answer()
 
 
-# Редактирование шаблонов
 @router.callback_query(F.data == "adm_edit_templates")
 async def adm_edit_templates(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -857,13 +854,38 @@ async def process_photo_invalid(message: Message):
 @router.message(SecretForm.waiting_for_link, F.text)
 async def process_link(message: Message, state: FSMContext):
     raw_text = message.text.strip()
-    clean_text = re.sub(r'\s+', '', raw_text)
+    link = re.sub(r'\s+', '', raw_text)
+    link_lower = link.lower()
 
-    if "roblox.com/share?code=" not in clean_text or not clean_text.endswith("type=Server"):
-        await message.answer("Отправьте ссылку именно на вип сервер.")
+    # --- ЗАЩИТА ССЫЛКИ ---
+    # 1. Проверка начала (https://roblox.com/ или https://www.roblox.com/)
+    if not (link_lower.startswith("https://roblox.com/") or link_lower.startswith("https://www.roblox.com/")):
+        await message.answer("❌ Ссылка должна начинаться с https://roblox.com/ или https://www.roblox.com/!")
         return
 
-    link = clean_text
+    # 2. Проверка конца (либо цифра на конце, либо заканчивается на type=server)
+    ends_with_digit = link[-1].isdigit()
+    ends_with_type_server = link_lower.endswith("type=server")
+    if not (ends_with_digit or ends_with_type_server):
+        await message.answer("❌ Ссылка должна заканчиваться либо на цифру, либо на type=server!")
+        return
+
+    # 3. Защита от русских букв
+    if re.search(r'[а-яА-ЯёЁ]', link):
+        await message.answer("❌ Ссылка не должна содержать русские буквы!")
+        return
+
+    # 4. Защита от t.me
+    if "t.me" in link_lower:
+        await message.answer("❌ Ссылка не может содержать t.me!")
+        return
+
+    # 5. Защита от @
+    if "@" in link:
+        await message.answer("❌ Ссылка не может содержать символ @!")
+        return
+    # ---------------------
+
     await state.update_data(link=link)
 
     data = await state.get_data()
