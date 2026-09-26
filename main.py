@@ -15,13 +15,12 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Message,
 )
 from fastapi import FastAPI
 import uvicorn
 
-# Токен и ID администратора из переменных окружения (скрыты от посторонних)
+# Токен и ID администратора из переменных окружения
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
@@ -109,13 +108,13 @@ def get_secret_types_dict() -> dict:
     conn.close()
     return {row[0]: row[1] for row in rows}
 
-def get_templates_dict() -> dict:
+def get_template_text(name: str) -> str | None:
     conn = sqlite3.connect("bot.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT name, html_text FROM templates")
-    rows = cursor.fetchall()
+    cursor.execute("SELECT html_text FROM templates WHERE name = ?", (name,))
+    row = cursor.fetchone()
     conn.close()
-    return {row[0]: row[1] for row in rows}
+    return row[0] if row else None
 
 # Состояния FSM
 class SecretForm(StatesGroup):
@@ -128,7 +127,6 @@ class AdminStates(StatesGroup):
     waiting_for_new_type_name = State()
     waiting_for_new_type_declined = State()
     waiting_for_new_timer = State()
-    waiting_for_template_name = State()
     waiting_for_template_text = State()
 
 # Клавиатуры
@@ -148,8 +146,7 @@ def get_admin_keyboard():
             [InlineKeyboardButton(text="➕ Добавить тип секретки", callback_data="adm_add_type")],
             [InlineKeyboardButton(text="🗑 Удалить тип секретки", callback_data="adm_del_type")],
             [InlineKeyboardButton(text="⏱ Изменить время таймера", callback_data="adm_set_timer")],
-            [InlineKeyboardButton(text="📝 Добавить шаблон", callback_data="adm_add_template")],
-            [InlineKeyboardButton(text="🗑 Удалить шаблон", callback_data="adm_del_template")],
+            [InlineKeyboardButton(text="📝 Изменить шаблон", callback_data="adm_edit_templates")],
             [InlineKeyboardButton(text="🔙 Выход", callback_data="adm_exit")],
         ]
     )
@@ -178,14 +175,19 @@ async def expire_post(bot: Bot, channel_id: str, message_id: int, secret_type: s
     conn.commit()
     conn.close()
 
-    expired_text = (
-        f"❕Секретка❕\n"
-        f"Секретка: {secret_type}\n\n"
-        f"Секретка: Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
-        f"🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | "
-        f"Наш <a href='https://t.me/ToHSecretss'>канал</a> | "
-        f"Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
-    )
+    # Проверяем, есть ли кастомный шаблон "измененного" поста в базе данных
+    custom_expired = get_template_text("expired")
+    if custom_expired:
+        expired_text = custom_expired.format(secret_type=secret_type)
+    else:
+        expired_text = (
+            f"❕Секретка❕\n"
+            f"Секретка: {secret_type}\n\n"
+            f"Секретка: Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
+            f"🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | "
+            f"Наш <a href='https://t.me/ToHSecretss'>канал</a> | "
+            f"Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+        )
 
     try:
         await bot.edit_message_caption(
@@ -490,83 +492,74 @@ async def process_delete_type(callback: CallbackQuery):
     await callback.answer()
 
 
-# ==================== УПРАВЛЕНИЕ ШАБЛОНАМИ ====================
+# ==================== УПРАВЛЕНИЕ ШАБЛОНАМИ ПО КНОПКАМ ====================
 
-@router.callback_query(F.data == "adm_add_template")
-async def adm_add_template(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "adm_edit_templates")
+async def adm_edit_templates(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    await callback.message.edit_text("📝 Введите название (ключ) нового шаблона (например, <code>main</code>):", parse_mode="HTML")
-    await state.set_state(AdminStates.waiting_for_template_name)
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Основной шаблон", callback_data="edit_tpl_main")],
+            [InlineKeyboardButton(text="📝 Измененный шаблон (время вышло)", callback_data="edit_tpl_expired")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")]
+        ]
+    )
+    await callback.message.edit_text(
+        "📝 Выберите, какой шаблон вы хотите изменить:",
+        reply_markup=keyboard
+    )
     await callback.answer()
 
-@router.message(AdminStates.waiting_for_template_name, F.text)
-async def process_template_name(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+@router.callback_query(F.data.startswith("edit_tpl_"))
+async def process_choose_template(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
         return
-    template_name = message.text.strip()
-    await state.update_data(template_name=template_name)
-    await message.answer(
-        "Теперь отправьте текст шаблона. Поддерживается HTML (включая скрытые теги эмодзи, кастомные смайлики и ссылки).",
+    
+    tpl_type = callback.data.split("_")[2] # main или expired
+    await state.update_data(editing_tpl_type=tpl_type)
+
+    if tpl_type == "main":
+        title = "<b>Основной шаблон</b>"
+        hint = "Доступные переменные: <code>{secret_type}</code>, <code>{declined_type}</code>, <code>{link}</code>"
+    else:
+        title = "<b>Измененный шаблон (время вышло)</b>"
+        hint = "Доступная переменная: <code>{secret_type}</code>"
+
+    await callback.message.edit_text(
+        f"📝 Редактирование: {title}\n\n"
+        f"Отправьте новый текст шаблона. Поддерживается полноценный HTML, скрытые теги эмодзи и ссылки.\n\n"
+        f"{hint}",
         parse_mode="HTML"
     )
     await state.set_state(AdminStates.waiting_for_template_text)
+    await callback.answer()
 
 @router.message(AdminStates.waiting_for_template_text)
-async def process_template_active(message: Message, state: FSMContext):
+async def process_save_template_text(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     
-    # Забираем полный HTML-код вместе со всеми скрытыми тегами эмодзи из сообщения
-    html_text = message.html_text
     data = await state.get_data()
-    template_name = data["template_name"]
+    tpl_type = data.get("editing_tpl_type", "main")
+    
+    # Забираем полный HTML-код со всеми скрытыми тегами эмодзи
+    html_text = message.html_text
 
     conn = sqlite3.connect("bot.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO templates (name, html_text) VALUES (?, ?)", (template_name, html_text))
+    cursor.execute("INSERT OR REPLACE INTO templates (name, html_text) VALUES (?, ?)", (tpl_type, html_text))
     conn.commit()
     conn.close()
 
     await state.clear()
+    tpl_name_rus = "Основной шаблон" if tpl_type == "main" else "Измененный шаблон"
     await message.answer(
-        f"✅ Шаблон <b>{template_name}</b> успешно сохранен со всеми скрытыми тегами и эмодзи!",
+        f"✅ <b>{tpl_name_rus}</b> успешно обновлен со всеми скрытыми тегами и эмодзи!",
         parse_mode="HTML",
         reply_markup=get_main_reply_keyboard(message.from_user.id)
     )
-
-@router.callback_query(F.data == "adm_del_template")
-async def adm_del_template(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    templates_dict = get_templates_dict()
-    if not templates_dict:
-        await callback.message.edit_text("📭 Нет доступных шаблонов для удаления.")
-        await callback.answer()
-        return
-
-    buttons = []
-    for t_name in templates_dict.keys():
-        buttons.append([InlineKeyboardButton(text=f"🗑 Удалить шаблон: {t_name}", callback_data=f"deltpl_{t_name}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")])
-
-    await callback.message.edit_text("🗑 Выберите шаблон для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("deltpl_"))
-async def process_delete_template(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    tpl_to_del = callback.data.split("_", 1)[1]
-
-    conn = sqlite3.connect("bot.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM templates WHERE name = ?", (tpl_to_del,))
-    conn.commit()
-    conn.close()
-
-    await callback.message.edit_text(f"✅ Шаблон <b>{tpl_to_del}</b> удален.", parse_mode="HTML")
-    await callback.answer()
 
 
 @router.callback_query(F.data == "adm_back")
@@ -712,17 +705,15 @@ async def process_link(message: Message, state: FSMContext):
     types_dict = get_secret_types_dict()
     declined_type = types_dict.get(secret_type, secret_type)
 
-    # Проверяем, есть ли сохраненный шаблон (например, под ключом "main")
-    templates_dict = get_templates_dict()
-    if "main" in templates_dict:
-        # Подставляем переменные в сохраненный шаблон
-        preview_text = templates_dict["main"].format(
+    # Проверяем, сохранен ли основной шаблон
+    custom_main = get_template_text("main")
+    if custom_main:
+        preview_text = custom_main.format(
             secret_type=secret_type,
             declined_type=declined_type,
             link=link
         )
     else:
-        # Дефолтный текст, если шаблон не задан через админку
         preview_text = (
             f"❕Секретка❕\n"
             f"Секретка: {secret_type}\n\n"
